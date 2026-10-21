@@ -570,7 +570,7 @@ def parse_blocks(page_id: str, body: str) -> tuple[dict[str, Any], list[str]]:
 def page_links(page_id: str, blocks: dict[str, Any], order: list[str]) -> list[dict[str, Any]]:
     links: list[dict[str, Any]] = []
     for bid in order:
-        for match in WIKILINK.finditer(blocks[bid]["source_text"]):
+        for match in WIKILINK.finditer(T.mask_code_spans(blocks[bid]["source_text"])):
             if not link_key(match.group(1)):            # `[[ ]]` 는 아무 page 도 가리키지 않는다
                 continue
             links.append({"target": norm(match.group(1)),
@@ -898,7 +898,7 @@ def body_links(page: dict[str, Any]) -> dict[str, str]:
     out: dict[str, str] = {}
     blocks = page.get("blocks") or {}
     for bid in page.get("block_order") or []:
-        for match in WIKILINK.finditer(str((blocks.get(bid) or {}).get("source_text") or "")):
+        for match in WIKILINK.finditer(T.mask_code_spans(str((blocks.get(bid) or {}).get("source_text") or ""))):
             out.setdefault(link_key(match.group(1)), norm(match.group(1)))
     out.pop("", None)
     return out

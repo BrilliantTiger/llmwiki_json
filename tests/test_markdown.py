@@ -244,6 +244,16 @@ class ParsedPagesAreConsistentTest(WorkspaceCase):
                     "links": llmwiki.page_links("page:x", blocks, order)}
             self.assertEqual(llmwiki.consistency_errors(page), [], repr(body))
 
+    def test_a_wikilink_inside_code_is_no_link(self) -> None:
+        body = "# Case\n\nrule `[['AUC-ROC','>=','0.85']]` and ``[[x]]`` but [[beta]]\n\n```\n[[gamma]]\n```\n"
+        path = self.write_raw("case.md", body)
+        page = llmwiki.page_from_markdown(self.ws, path)
+        self.assertEqual([link["target"] for link in page["links"]], ["beta"])
+        self.assertEqual(page["blocks"][page["block_order"][1]]["refs"], ["beta"])
+        self.assertEqual(page["blocks"][page["block_order"][2]]["refs"], [])
+        self.assertEqual(llmwiki.validate_page(page, llmwiki.SchemaValidator.load(self.ws)), [])
+        self.assertEqual(llmwiki.consistency_errors(page), [])
+
     def test_an_empty_wikilink_is_no_link(self) -> None:
         path = self.write_raw("case.md", "# Case\n\nx [[ ]] y [[_]] z [[beta]]\n")
         page = llmwiki.page_from_markdown(self.ws, path)

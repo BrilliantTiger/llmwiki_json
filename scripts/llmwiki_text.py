@@ -17,6 +17,8 @@ import unicodedata
 from typing import Any, Iterable
 
 WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]")
+# `[['AUC-ROC','>=','0.85']]` inside a code span is data, not a link.
+INLINE_CODE = re.compile(r"(`+)(?:.|\n)*?\1")
 LINK_SEPARATOR = re.compile(r"[\s_]+")
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -129,9 +131,14 @@ def link_key(value: str) -> str:
     return LINK_SEPARATOR.sub("-", text).strip("-")
 
 
+def mask_code_spans(text: str) -> str:
+    """Blank inline code, keeping offsets, so code spans yield no wikilinks."""
+    return INLINE_CODE.sub(lambda m: " " * len(m.group(0)), text)
+
+
 def refs_in(text: str) -> list[str]:
     """`[[…]]` targets in `text`. An empty one (`[[ ]]`, `[[_]]`) names no page and is no link."""
-    return sorted({norm(m.group(1)) for m in WIKILINK.finditer(text) if link_key(m.group(1))})
+    return sorted({norm(m.group(1)) for m in WIKILINK.finditer(mask_code_spans(text)) if link_key(m.group(1))})
 
 
 def strip_ref_prefix(ref: str) -> tuple[str, str]:
