@@ -317,3 +317,38 @@ class UpdateContinuityTest(WorkspaceCase):
         for number, (head, expected) in enumerate(cases.items()):
             path = self.write_raw(f"s{number}.md", f"---\ntype: concept\n{head}---\n# S\n\n본문.\n")
             self.assertEqual(llmwiki.page_from_markdown(self.ws, path)["summary"], expected, head)
+
+
+class NonMarkdownIngestTest(WorkspaceCase):
+    def test_html_becomes_a_page_of_its_text(self) -> None:
+        path = self.write_raw("spec.html", "<html><body><h1>Spec</h1><p>first rule</p><script>x()</script></body></html>")
+        result = llmwiki.ingest(self.ws, path)
+        page = self.read_json(result["dest"])
+        self.assertEqual(page["raw_ref"], "raw/spec.html")
+        self.assertIn("first rule", page["source_snapshot"]["text"])
+        self.assertNotIn("x()", page["source_snapshot"]["text"])
+        self.assertEqual(page["source_snapshot"]["format"], "markdown")
+
+    def test_a_binary_without_text_becomes_a_stub(self) -> None:
+        path = self.root / "raw" / "shot.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        page = self.read_json(llmwiki.ingest(self.ws, path)["dest"])
+        self.assertEqual(page["source_snapshot"]["format"], "text")
+        self.assertIn("raw/shot.png", page["source_snapshot"]["text"])
+
+    def test_a_credential_in_a_converted_body_is_masked(self) -> None:
+        path = self.write_raw("conf.csv", "name,value\ndb,password=hunter2secret\n")
+        page = self.read_json(llmwiki.ingest(self.ws, path)["dest"])
+        self.assertNotIn("hunter2secret", json.dumps(page, ensure_ascii=False))
+
+    def test_slug_and_tag_override(self) -> None:
+        path = self.write_raw("a/README.md", "# A\n")
+        page = self.read_json(llmwiki.ingest(self.ws, path, slug="a-readme", tags=["note"])["dest"])
+        self.assertEqual(page["slug"], "a-readme")
+        self.assertIn("note", page["tags"])
+
+    def test_a_plain_json_file_is_content_not_a_page(self) -> None:
+        path = self.write_raw("settings.json", '{"theme": "dark"}')
+        page = self.read_json(llmwiki.ingest(self.ws, path)["dest"])
+        self.assertIn("dark", page["source_snapshot"]["text"])

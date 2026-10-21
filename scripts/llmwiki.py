@@ -637,12 +637,77 @@ def lead_text(block: dict[str, Any]) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def is_page_object(path: Path) -> bool:
+    """True only for a JSON file that is itself a canonical page.
+
+    Ordinary data/config JSON in raw/ (skills-lock.json, settings.json, data
+    samples) is content to be recorded, not a page to be validated.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return False
+    def looks_like_page(value: Any) -> bool:
+        return isinstance(value, dict) and "schema_version" in value and "blocks" in value
+
+    # A list of pages still reaches the page branch so it keeps raising the
+    # "single page object" error rather than being silently stored as data.
+    if isinstance(data, list):
+        return bool(data) and looks_like_page(data[0])
+    return looks_like_page(data)
+
+
+def load_extractors():
+    """Import scripts/extract.py regardless of how llmwiki.py was invoked."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "llmwiki_extract", Path(__file__).resolve().parent / "extract.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def stub_body(ws: Workspace, path: Path) -> str:
+    """Body for a source that carries no extractable text (image, archive, media).
+
+    The file still becomes a page so that raw/ and wiki/ stay one-to-one.
+    """
+    stat = path.stat()
+    kb = max(1, round(stat.st_size / 1024))
+    return "\n".join([
+        f"# {path.name}",
+        "",
+        f"본문을 추출할 수 없는 원본입니다 (`{path.suffix.lower() or 'no-ext'}`). "
+        "이 페이지는 파일의 존재와 위치를 기록합니다.",
+        "",
+        f"- 경로: `{ws.rel(path)}`",
+        f"- 형식: `{path.suffix.lower().lstrip('.') or 'unknown'}`",
+        f"- 크기: {kb:,} KB",
+        f"- 수정: {dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc).date().isoformat()}",
+    ])
+
+
+def redact_secrets(text: str) -> tuple[str, int]:
+    """Mask credential values in *converted* bodies (pdf/office/…).
+
+    An original markdown source still fails hard — it can be edited. A binary
+    original cannot, so the page records the document with the value removed
+    instead of dropping the document entirely.
+    """
+    masked = T.redact(text)
+    return masked, max(0, masked.count(T.MASK) - text.count(T.MASK))
+
+
 def page_from_markdown(ws: Workspace, path: Path, page_type: str | None = None,
-                       projects: list[str] | None = None, summary: str = "") -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8")
+                       projects: list[str] | None = None, summary: str = "",
+                       slug: str = "", text: str = "", fmt: str = "markdown",
+                       tags: list[str] | None = None) -> dict[str, Any]:
+    # `text` lets a caller pass a converted body (PDF/office/…); the page still
+    # records the untouched original as its raw_ref.
+    text = text or path.read_text(encoding="utf-8")
     assert_no_secrets(text, ws.rel(path))
     meta, body = split_frontmatter(text)
-    slug = norm(path.stem).replace(" ", "-").lower()
+    slug = norm(slug or path.stem).replace(" ", "-").lower()
     page_id = f"page:{slug}"
     blocks, order = parse_blocks(page_id, body)
     title = next((b["data"]["text"] for b in blocks.values()
@@ -662,7 +727,7 @@ def page_from_markdown(ws: Workspace, path: Path, page_type: str | None = None,
         "schema_version": SCHEMA_VERSION, "id": page_id, "slug": slug, "title": title,
         "type": page_type or meta.get("type") or "source",
         "created": meta.get("created") or stamp, "updated": meta.get("updated") or stamp,
-        "tags": canonical_tags(meta.get("tags"), vocabulary),
+        "tags": canonical_tags(string_list(tags) or meta.get("tags"), vocabulary),
         **({"keywords": keywords} if keywords else {}),
         "projects": string_list(projects) or string_list(meta.get("projects")),
         "sources": source_refs, "raw_ref": raw_ref,
@@ -670,7 +735,7 @@ def page_from_markdown(ws: Workspace, path: Path, page_type: str | None = None,
         "blocks": blocks, "block_order": order, "links": links,
         "history": [{"at": stamp, "action": "ingested", "actor": "llmwiki-cli",
                      "note": repo_path(ws, path) or path.name}],
-        "source_snapshot": {"format": "markdown", "text": text, "sha256": sha(text)},
+        "source_snapshot": {"format": fmt, "text": text, "sha256": sha(text)},
     }
 
 
@@ -1927,7 +1992,8 @@ def read_log(ws: Workspace, limit: int = 10) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- ingest
 def ingest(ws: Workspace, source: Path, page_type: str | None = None,
            projects: list[str] | None = None, summary: str = "",
-           update: bool = False, dry_run: bool = False) -> dict[str, Any]:
+           update: bool = False, dry_run: bool = False, slug: str = "",
+           tags: list[str] | None = None) -> dict[str, Any]:
     """Write one canonical page. raw/ is read-only and is verified untouched."""
     path = Path(source).resolve()
     if not path.exists() or not path.is_file():
@@ -1939,10 +2005,26 @@ def ingest(ws: Workspace, source: Path, page_type: str | None = None,
         pass
 
     before = sha_bytes(path.read_bytes())
-    text = path.read_text(encoding="utf-8")
+    suffix = path.suffix.lower()
+    converted, fmt = "", "markdown"
+    if suffix in {".md", ".markdown", ""}:
+        text = path.read_text(encoding="utf-8")
+    elif suffix == ".json" and is_page_object(path):
+        text = path.read_text(encoding="utf-8")
+    else:
+        # pdf / office / html / csv / code / binary — extract what is readable and
+        # fall back to a metadata-only stub so nothing in raw/ is skipped.
+        extractors = load_extractors()
+        body, has_text = extractors.extract(path)
+        converted = body or stub_body(ws, path)
+        converted, redacted = redact_secrets(converted)
+        if redacted:
+            print(f"note: {ws.rel(path)} — 보안정보 {redacted}건 가림", file=sys.stderr)
+        fmt = "markdown" if has_text else "text"
+        text = converted
     assert_no_secrets(text, ws.rel(path))
 
-    if path.suffix.lower() == ".json":
+    if suffix == ".json" and not converted:
         page = json.loads(text)
         if isinstance(page, list):
             raise WikiError("ingest takes a single page object, not an array")
@@ -1953,6 +2035,9 @@ def ingest(ws: Workspace, source: Path, page_type: str | None = None,
             page["projects"] = projects
         if summary:
             page["summary"] = summary
+        if slug:
+            page["slug"] = norm(slug).replace(" ", "-").lower()
+            page["id"] = f"page:{page['slug']}"
         for key in ("tags", "keywords", "projects", "sources"):
             if key in page:
                 page[key] = string_list(page[key])
@@ -1962,7 +2047,8 @@ def ingest(ws: Workspace, source: Path, page_type: str | None = None,
             {"at": today(), "action": "ingested", "actor": "llmwiki-cli",
              "note": repo_path(ws, path) or path.name})
     else:
-        page = page_from_markdown(ws, path, page_type, projects, summary)
+        page = page_from_markdown(ws, path, page_type, projects, summary, slug,
+                                  converted, fmt, tags)
 
     # 쓰기 경로는 어긋난 page 를 들이지 않는다 — markdown 은 파서가 만들어 늘 맞고, JSON 소스는 여기서 걸린다.
     errors = validate_page(page, SchemaValidator.load(ws)) + consistency_errors(page)
@@ -3073,6 +3159,10 @@ def build_parser() -> argparse.ArgumentParser:
     ing.add_argument("--type", choices=sorted(ALLOWED_TYPES))
     ing.add_argument("--project", action="append", default=[])
     ing.add_argument("--summary", default="")
+    ing.add_argument("--tag", action="append", default=[])
+    ing.add_argument("--slug", default="",
+                     help="override the page slug (default: the file stem) — "
+                          "use it when several sources share a filename")
     ing.add_argument("--update", action="store_true", help="replace an existing page, keeping created/history")
     ing.add_argument("--dry-run", action="store_true")
 
@@ -3195,7 +3285,7 @@ def run(argv: list[str] | None = None) -> int:
 
     if command == "ingest":
         emit(ingest(ws, Path(args.input), args.type, args.project, args.summary,
-                    args.update, args.dry_run))
+                    args.update, args.dry_run, args.slug, args.tag))
     elif command == "edit":
         emit(edit(ws, args.selector, args.block, read_fragment(args.text, args.file),
                   dry_run=args.dry_run))
